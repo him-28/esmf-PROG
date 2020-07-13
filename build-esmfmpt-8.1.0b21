@@ -1,0 +1,188 @@
+#!/bin/bash
+#
+
+# ===== BUILD CONFIGURATION
+
+# Configure environment
+module purge
+module load ncarenv/1.3
+module load intel/19.0.5
+module load mpt/2.21
+module load netcdf-mpi/4.7.3
+module load pnetcdf/1.12.1
+module load pio/2.4.4
+module load ncarcompilers/0.5.0
+
+# Setup variables
+if [ "$LMOD_FAMILY_MPI" == "mpt" ]; then
+    export ESMF_COMM="mpt"
+fi 
+if [ "$LMOD_FAMILY_MPI" == "impi" ]; then
+    export ESMF_COMM="intelmpi"
+fi
+if [ -z "$LMOD_FAMILY_MPI" ]; then
+    export ESMF_COMM="mpiuni"
+fi
+
+if [ "$LMOD_FAMILY_COMPILER" == "intel" ]; then
+    export ESMF_COMPILER="intel"
+fi
+if [ "$LMOD_FAMILY_COMPILER" == "gnu" ]; then
+    export ESMF_COMPILER="gfortran"
+fi
+
+# Define global software settings
+SWNAME=esmf
+SWVERS=8.1.0b21
+HPCI_SW_DIR=/glade/p/cesmdata/cseg/PROGS/$SWNAME/$SWVERS/$ESMF_COMM/$LMOD_FAMILY_MPI_VERSION/$LMOD_FAMILY_COMPILER/$LMOD_FAMILY_COMPILER_VERSION
+MAKEJOBS=32
+
+# Module configuration
+# MODDESC provides "Help" description of software (use \n\n for paragraphs)
+MODSITE=https://www.earthsystemcog.org/projects/esmf/
+HPCI_MOD_DIR=/glade/p/cesmdata/cseg/PROGS/modulefiles
+
+# Define build itinerary
+SWPKGS[0]=${SWNAME}-$SWVERS
+
+echo -e "\n>>> BEGINNING BUILD [${SWNAME}-${SWVERS}]\n"
+echo "Building with ${LMOD_FAMILY_COMPILER} compilers ..."
+
+# ===== UNPACK SOURCE FILES AND PREPARE GLOBAL ENVIRONMENT
+
+# Set position indepedence and configure make for MPI
+export {CPPFLAGS,CFLAGS,CXXFLAGS,FFLAGS,FCFLAGS,F77FLAGS,F90FLAGS}=-fPIC
+PYMAJOR=$(module list |& grep -oP ' python/.{0,3}' | cut -d/ -f2)
+
+# Make directory for build using PID to avoid clobbers from multiple builds
+echo "Preparing source files ..."
+BPID=$$
+mkdir -p $BPID; cd $BPID
+
+for P in ${!SWPKGS[@]}; do
+	PKG=${SWPKGS[$P]}
+
+	# Unpackage source files
+	if [[ -e ../${PKG}.tar.gz ]]; then
+        tar -xf ../${PKG}.tar.gz
+		SRCDIR=$(ls -1c --color=never | head -1)
+        [[ $SRCDIR != $PKG ]] && mv $SRCDIR $PKG
+	else
+		echo -e "\n*** ERROR: source for $PKG does not exist! Exiting ..."
+		exit 2
+	fi
+done
+
+# ===== BUILD AND INSTALL SOFTWARE PACKAGES
+
+function run_cmd {
+	echo -e "\n>>> RUNNING COMMAND [${1}]\n"
+
+	eval $1
+	RETVAL=${PIPESTATUS[0]}
+
+	if [[ $RETVAL != 0 ]]; then
+		echo -e "\n*** ERROR: command exited with code ${RETVAL}! Exiting ..."
+		exit 1
+	fi
+}
+
+echo -e "\n1) BUILDING PACKAGE [${SWPKGS[0]}] ...\n"
+cd ${SWPKGS[0]}
+
+# Set ESMF build variables
+export ESMF_DIR=$(pwd -P)
+export ESMF_INSTALL_PREFIX=$HPCI_SW_DIR
+export ESMF_PIO="internal"
+export ESMF_YAMLCPP="internal"
+
+if [[ ${NETCDF}z != z ]]; then
+    export ESMF_NETCDF=nc-config
+fi
+
+# Run both BOPT settings
+for ESMF_BOPT in O g; do
+    export ESMF_BOPT
+    run_cmd "make -j $MAKEJOBS"
+    run_cmd "make install"
+    #run_cmd "make all_tests log_mpt"
+done
+
+cd ../../
+
+# ===== CLEAN FILES
+
+echo -e "\n<<< BUILD COMPLETE!\n"
+echo "Cleaning source files ..."
+rm -rf $BPID
+
+# ===== INSTALL THE MODULE
+
+# Set path for lua file
+MODPATH=${HPCI_MOD_DIR}/esmfpkgs/${LMOD_FAMILY_COMPILER}/$LMOD_FAMILY_COMPILER_VERSION
+[[ ${ESMF_NETCDF}z == z ]] && IOMOD=defio || IOMOD=ncdfio
+MPIMOD=${ESMF_COMM}
+MODSTUB=${MODPATH}/${SWNAME}-${SWVERS}-${IOMOD}-${MPIMOD}
+DEPLIST=$(module list 2>&1 | awk -F '[0-9, ][0-9])' '{for(i=2;i<=NF;i++) {print "  "$i}}')
+
+echo "Configuring and installing modulefile ..."
+
+# Need to ensure group write access so git repository is consistent
+umask 0002
+mkdir -p $MODPATH
+
+# Write the module file template for this software
+for ESMF_BOPT in O g; do
+MODFILE=${MODSTUB}-${ESMF_BOPT}.lua
+echo "Path: ${MODFILE}"
+cat > $MODFILE << EOF
+require("posix")
+
+-- The message printed by the module whatis command
+whatis("${SWNAME} library v${SWVERS}")
+
+-- The message printed by the module help command
+help([[
+This module loads the ESMF library v$SWVERS
+for the $LMOD_FAMILY_COMPILER using these settings:
+
+  ESMF_COMPILER       = $ESMF_COMPILER
+  ESMF_BOPT           = $ESMF_BOPT
+  ESMF_COMM           = $ESMF_COMM
+EOF
+
+if [[ ${ESMF_NETCDF}z != z ]]; then
+cat >> $MODFILE << EOF
+  ESMF_NETCDF         = $ESMF_NETCDF
+  ESMF_NETCDF_INCLUDE = \${NETCDF}/include
+  ESMF_NETCDF_LIBRARY = \${NETCDF}/lib
+EOF
+fi
+
+cat >> $MODFILE << EOF
+
+The module sets:
+
+  ESMF_LIBDIR
+  ESMFMKFILE  = \${ESMF_LIBDIR}/esmf.mk
+
+Software website - ${MODSITE}
+
+Built on $(date)
+Modules used:
+${DEPLIST}
+]])
+
+-- Set paths for software binaries, libraries
+local basepath = "${HPCI_SW_DIR}"
+local esmftype = "Linux.${ESMF_COMPILER}.64.${ESMF_COMM}.default"
+local binpath  = pathJoin(basepath, "bin/bin${ESMF_BOPT}", esmftype) -- binaries
+local libpath  = pathJoin(basepath, "lib/lib${ESMF_BOPT}", esmftype) -- libraries
+
+-- Update path variables in user environment
+prepend_path("PATH",    binpath)
+prepend_path("LD_LIBRARY_PATH",    libpath)
+setenv("ESMF_LIBDIR",   libpath)
+setenv("ESMFMKFILE",    libpath .. "/esmf.mk")
+EOF
+done
